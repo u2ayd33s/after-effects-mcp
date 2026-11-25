@@ -1317,24 +1317,40 @@ autoRunCheckbox.value = true;
 var checkInterval = 2000;
 var isChecking = false;
 
-// Command file path - use Documents folder for reliable access
-function getCommandFilePath() {
-    var userFolder = Folder.myDocuments;
-    var bridgeFolder = new Folder(userFolder.fsName + "/ae-mcp-bridge");
+// Bridge folder - keep it OFF any cloud-synced path.
+// Documents is frequently redirected into OneDrive by Known Folder Move, and the sync client
+// takes short-lived locks on files it is uploading. This folder sees a write on every poll, so
+// those locks surface as "Failed to open result file for writing" and dropped commands.
+// LOCALAPPDATA is never synced and is readable from Node with the identical value, which keeps
+// the panel and the MCP server pointed at the same place.
+function getBridgeFolder() {
+    var base = null;
+    try {
+        var localAppData = $.getenv("LOCALAPPDATA");
+        if (localAppData && new Folder(localAppData).exists) {
+            base = localAppData;
+        }
+    } catch (e) {
+        base = null;
+    }
+    if (!base) {
+        base = Folder.myDocuments.fsName;
+    }
+    var bridgeFolder = new Folder(base + "/ae-mcp-bridge");
     if (!bridgeFolder.exists) {
         bridgeFolder.create();
     }
-    return bridgeFolder.fsName + "/ae_command.json";
+    return bridgeFolder.fsName;
 }
 
-// Result file path - use Documents folder for reliable access
+// Command file path
+function getCommandFilePath() {
+    return getBridgeFolder() + "/ae_command.json";
+}
+
+// Result file path
 function getResultFilePath() {
-    var userFolder = Folder.myDocuments;
-    var bridgeFolder = new Folder(userFolder.fsName + "/ae-mcp-bridge");
-    if (!bridgeFolder.exists) {
-        bridgeFolder.create();
-    }
-    return bridgeFolder.fsName + "/ae_mcp_result.json";
+    return getBridgeFolder() + "/ae_mcp_result.json";
 }
 
 // --- setCompositionProperties: set duration, frameRate, etc. on active or named comp ---
