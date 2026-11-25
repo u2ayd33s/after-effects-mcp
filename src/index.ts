@@ -21,15 +21,66 @@ const __dirname = path.dirname(__filename);
 const SCRIPTS_DIR = path.join(__dirname, "scripts");
 const TEMP_DIR = path.join(__dirname, "temp");
 
-// Get the correct directory for AE bridge files
-// Use ~/Documents/ae-mcp-bridge for reliable cross-process access
+// Get the correct directory for AE bridge files.
+// Must stay in lockstep with getBridgeFolder() in scripts/mcp-bridge-auto.jsx: LOCALAPPDATA
+// when available, else the Documents folder. Documents is a poor default here because OneDrive
+// Known Folder Move both redirects it (so ~/Documents is the wrong guess) and locks files while
+// uploading them, which breaks a folder that takes a write on every poll.
+let cachedBridgeDir: string | null = null;
+
+function getBridgeBaseDir(): string {
+  const localAppData = process.env.LOCALAPPDATA;
+  if (localAppData && fs.existsSync(localAppData)) {
+    return localAppData;
+  }
+  return getDocumentsDir();
+}
+
+function getDocumentsDir(): string {
+  if (process.platform === "win32") {
+    // [Environment]::GetFolderPath('MyDocuments') is the same CSIDL_PERSONAL lookup that
+    // ExtendScript's Folder.myDocuments performs, so it agrees with the bridge panel even
+    // when the folder is redirected. Route the answer through a UTF-8 file rather than
+    // stdout: console output uses the OEM codepage (932 here), which mangles non-ASCII
+    // paths such as the localized "ドキュメント" leaf and makes existsSync fail.
+    const outFile = path.join(os.tmpdir(), `ae_mcp_docdir_${process.pid}.txt`);
+    try {
+      const psCommand =
+        `[System.IO.File]::WriteAllText('${outFile}', ` +
+        `[Environment]::GetFolderPath('MyDocuments'), [System.Text.Encoding]::UTF8)`;
+      execSync(`powershell -NoProfile -NonInteractive -Command "${psCommand}"`, {
+        windowsHide: true,
+        stdio: "ignore"
+      });
+      const documentsDir = fs.readFileSync(outFile, "utf8").trim();
+      if (documentsDir && fs.existsSync(documentsDir)) {
+        return documentsDir;
+      }
+      console.error(`Resolved Documents folder is unusable: "${documentsDir}"`);
+    } catch (error) {
+      console.error(`Could not resolve Documents folder: ${String(error)}`);
+    } finally {
+      try {
+        fs.unlinkSync(outFile);
+      } catch {
+        // nothing to clean up
+      }
+    }
+  }
+  return path.join(os.homedir(), 'Documents');
+}
+
 function getAETempDir(): string {
-  const homeDir = os.homedir();
-  const bridgeDir = path.join(homeDir, 'Documents', 'ae-mcp-bridge');
+  if (cachedBridgeDir) {
+    return cachedBridgeDir;
+  }
+  const bridgeDir = path.join(getBridgeBaseDir(), 'ae-mcp-bridge');
   // Ensure the directory exists
   if (!fs.existsSync(bridgeDir)) {
     fs.mkdirSync(bridgeDir, { recursive: true });
   }
+  console.error(`Bridge directory: ${bridgeDir}`);
+  cachedBridgeDir = bridgeDir;
   return bridgeDir;
 }
 
@@ -104,8 +155,41 @@ async function waitForBridgeResult(expectedCommand?: string, timeoutMs: number =
   return JSON.stringify({ error: `Timed out waiting for bridge result${expectedCommand ? ` for command '${expectedCommand}'` : ''}.` });
 }
 
+// Wait until the bridge panel is no longer touching ae_command.json.
+// The panel writes the result file first and only then calls updateCommandStatus("completed"),
+// which re-reads and rewrites ae_command.json. A command written into that window has its
+// "pending" status clobbered back to "completed", so the panel never runs it and the caller
+// waits for a result that will never arrive.
+async function waitForCommandFileIdle(timeoutMs: number = 10000, pollMs: number = 200): Promise<void> {
+  const commandFile = path.join(getAETempDir(), 'ae_command.json');
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    let busy = false;
+    try {
+      if (fs.existsSync(commandFile)) {
+        const raw = fs.readFileSync(commandFile, 'utf8').trim();
+        if (raw) {
+          const status = JSON.parse(raw).status;
+          busy = status === "pending" || status === "running";
+        }
+      }
+    } catch {
+      // missing or caught mid-write; treat as idle and let the write below race-free retry
+    }
+    if (!busy) {
+      // Give the panel's own status write time to land before we overwrite the file.
+      await new Promise(r => setTimeout(r, 300));
+      return;
+    }
+    await new Promise(r => setTimeout(r, pollMs));
+  }
+  console.error("Command file still busy after waiting; writing anyway.");
+}
+
 // Helper function to write command to file
-function writeCommandFile(command: string, args: Record<string, any> = {}): void {
+async function writeCommandFile(command: string, args: Record<string, any> = {}): Promise<void> {
+  await waitForCommandFileIdle();
   try {
     const commandFile = path.join(getAETempDir(), 'ae_command.json');
     const commandData = {
@@ -147,7 +231,7 @@ server.resource(
   async (uri) => {
     // Clear old results, queue the command, and wait for bridge output
     clearResultsFile();
-    writeCommandFile("listCompositions", {});
+    await writeCommandFile("listCompositions", {});
     const result = await waitForBridgeResult("listCompositions", 6000, 250);
 
     return {
@@ -210,7 +294,7 @@ server.tool(
       clearResultsFile();
       
       // Write command to file for After Effects to pick up
-      writeCommandFile(script, parameters);
+      await writeCommandFile(script, parameters);
       
       return {
         content: [
@@ -405,7 +489,7 @@ server.tool(
   async (params) => {
     try {
       // Write command to file for After Effects to pick up
-      writeCommandFile("createComposition", params);
+      await writeCommandFile("createComposition", params);
       
       return {
         content: [
@@ -456,7 +540,7 @@ server.tool(
   async (parameters) => {
     try {
       // Queue the command for After Effects
-      writeCommandFile("setLayerKeyframe", parameters);
+      await writeCommandFile("setLayerKeyframe", parameters);
       
       return {
         content: [
@@ -493,7 +577,7 @@ server.tool(
   async (parameters) => {
     try {
       // Queue the command for After Effects
-      writeCommandFile("setLayerExpression", parameters);
+      await writeCommandFile("setLayerExpression", parameters);
       
       return {
         content: [
@@ -652,7 +736,7 @@ server.tool(
   async (parameters) => {
     try {
       // Queue the command for After Effects
-      writeCommandFile("applyEffect", parameters);
+      await writeCommandFile("applyEffect", parameters);
       
       return {
         content: [
@@ -700,7 +784,7 @@ server.tool(
   async (parameters) => {
     try {
       // Queue the command for After Effects
-      writeCommandFile("applyEffectTemplate", parameters);
+      await writeCommandFile("applyEffectTemplate", parameters);
       
       return {
         content: [
@@ -741,7 +825,7 @@ server.tool(
   async (parameters) => {
     try {
       // Queue the command for After Effects
-      writeCommandFile("applyEffect", parameters);
+      await writeCommandFile("applyEffect", parameters);
       
       // Wait a bit for After Effects to process the command
       await new Promise(resolve => setTimeout(resolve, 1000));
@@ -794,7 +878,7 @@ server.tool(
   async (parameters) => {
     try {
       // Queue the command for After Effects
-      writeCommandFile("applyEffectTemplate", parameters);
+      await writeCommandFile("applyEffectTemplate", parameters);
       
       // Wait a bit for After Effects to process the command
       await new Promise(resolve => setTimeout(resolve, 1000));
@@ -920,7 +1004,7 @@ server.tool(
       clearResultsFile();
       
       // Write command to file for After Effects to pick up
-      writeCommandFile("bridgeTestEffects", {});
+      await writeCommandFile("bridgeTestEffects", {});
       
       return {
         content: [
